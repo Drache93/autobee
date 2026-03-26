@@ -9,6 +9,7 @@ const crypto = require('hypercore-crypto')
 const c = require('compact-encoding')
 const asserts = require('./lib/asserts.js')
 const encoding = require('./lib/encoding.js')
+const FastForward = require('./lib/fast-forward.js')
 const System = require('./lib/system.js')
 const ApplyCalls = require('./lib/apply-calls.js')
 const topo = require('./lib/topo.js')
@@ -16,6 +17,7 @@ const { ActiveWriters } = require('./lib/writers.js')
 const UpdateChanges = require('./lib/updates.js')
 
 const EMPTY_HEAD = { length: 0, key: null }
+const MIN_FF_WAIT = 300_000 // wait at least 5min before attempting to ff again after failure
 
 module.exports = class Autobee extends ReadyResource {
   constructor(store, key = null, handlers = {}) {
@@ -62,6 +64,11 @@ module.exports = class Autobee extends ReadyResource {
     this.writers = null
     this.lock = new ScopeLock()
     this.bumping = 0
+
+    this.fastForwardEnabled = handlers.fastForward !== false
+    this.fastForwarding = null
+    this.fastForwardTo = null
+    this.fastForwardFailedAt = 0
 
     this._workingBee = bee
     this._workingView = handlers.open ? handlers.open(this._workingBee, this) : this._workingBee
@@ -230,6 +237,11 @@ module.exports = class Autobee extends ReadyResource {
 
     while (this.bumping === 1) {
       await this.lock.lock()
+
+      if (this.fastForwardTo !== null) {
+        await this._applyFastForward()
+        continue // revaluate conditions...
+      }
 
       try {
         while (!this.closing) {
@@ -496,6 +508,62 @@ module.exports = class Autobee extends ReadyResource {
     }
 
     await this._bump()
+  }
+
+  queueFastForward(head) {
+    if (!this.fastForwardEnabled || this.fastForwarding !== null) return
+    if (this.fastForwardTo !== null) return
+    if (Date.now() - this.fastForwardFailedAt < MIN_FF_WAIT) return
+
+    this._runFastForward(new FastForward(this, head, { verified: false })).catch(noop)
+  }
+
+  async _runFastForward(ff) {
+    this.fastForwarding = ff
+
+    const result = await ff.upgrade()
+    await ff.close()
+
+    if (this.fastForwarding === ff) this.fastForwarding = null
+
+    if (!result) {
+      if (ff.failed) this.fastForwardFailedAt = Date.now()
+      return
+    }
+
+    this.fastForwardFailedAt = 0
+    this.fastForwardTo = result
+
+    this.bumpSoon()
+  }
+
+  async _applyFastForward() {
+    const changes = this._hasUpdate ? new UpdateChanges(this) : null
+    if (changes) changes.track(this._applyState)
+
+    const head = this.fastForwardTo
+
+    const from = this.system.bee.head()
+    const to = head
+
+    this.system.bee.move(head)
+    await this.system.reset()
+
+    this.bee.move(this.system.view)
+    this._workingBee.move(this.system.view)
+
+    this.fastForwardTo = null
+
+    if (changes) changes.finalise()
+
+    await this.writers.refresh()
+    if (!this.localWriter || this.localWriter.closed) {
+      await this.writers.updateLocalState()
+    }
+
+    if (changes) await this._handlers.update(this.view, changes)
+
+    this.emit('fast-forward', to, from)
   }
 }
 
